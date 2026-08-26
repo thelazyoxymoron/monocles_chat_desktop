@@ -1,0 +1,1057 @@
+//! PQ OMEMO2 orchestration (Stages C/D): PEP device-list/bundle publish+fetch, session
+//! establishment, and `<encrypted>` stanza build/parse. The crypto lives in `mxc-omemo`;
+//! this module is the XMPP glue.
+//!
+//! Per-account [`OmemoStores`] (with the identity key loaded from the secret service) are
+//! cached process-globally and populated by [`ensure_initialized`] at bootstrap.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+use async_channel::Sender;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use minidom::Element;
+
+use tracing::{debug, info, warn};
+
+use mxc_omemo::bundle::Bundle;
+use mxc_omemo::sce::Envelope;
+use mxc_omemo::session::{self, DeviceAddr, EncryptedMessage, WrappedKey};
+use mxc_omemo::store::OmemoStores;
+use mxc_store::{secrets, Store};
+
+use crate::client::{AccountConfig, Writer};
+use crate::event::Event;
+use crate::xeps::pep;
+use crate::xeps::roster::new_id;
+
+// PQ-OMEMO2 (proto-XEP OMEMO-PQXDH). Deliberately NOT urn:xmpp:omemo:2: this stack is
+// wire-incompatible with XEP-0384 v0.9 (AES-256-GCM payload scheme, mandatory PQXDH v4
+// handshake, mandatory hybrid PQ identity), so sharing the standard namespace would make
+// genuine XEP-0384 clients fetch our bundles, burn prekeys and hard-fail undebuggably.
+// Under a distinct namespace the two ecosystems simply ignore each other.
+// MUST stay in lockstep with the Android client (Namespace.OMEMO2).
+pub const NS_OMEMO2: &str = "urn:monocles:omemo-pq:1";
+pub const NODE_DEVICES: &str = "urn:monocles:omemo-pq:1:devices";
+pub const NODE_BUNDLES: &str = "urn:monocles:omemo-pq:1:bundles";
+const NS_EME: &str = "urn:xmpp:eme:0";
+const NS_CLIENT: &str = "jabber:client";
+const NS_HINTS: &str = "urn:xmpp:hints";
+
+const PREKEY_COUNT: u32 = 100;
+const SIGNED_PREKEY_ID: u32 = 1;
+const KEM_SIGNED_ID: u32 = 1;
+const FIRST_PREKEY_ID: u32 = 100;
+/// Replenish one-time pre-keys once the available count drops below this (proto-XEP §4.5).
+const PREKEY_LOW_WATER: u32 = 50;
+
+/// What `decrypt_message` recovers.
+pub struct Decrypted {
+    /// The SCE envelope XML bytes (to be parsed + binding-checked by the caller).
+    pub envelope: Vec<u8>,
+    pub sender_device: u32,
+    pub fingerprint: String,
+    /// True if this was a key-exchange (PreKey) message — it consumed a one-time pre-key,
+    /// so the caller should replenish + republish the bundle.
+    pub was_kex: bool,
+    /// True if this was a key-transport message (a `<header>` with no `<payload>`): the session
+    /// was (re)established as a side effect, but there is no content to display.
+    pub key_transport: bool,
+    /// True if this message's Double Ratchet counter reached the XEP-0384 heartbeat threshold and
+    /// we have not yet heartbeated for its ratchet key: the caller should send a heartbeat back to
+    /// `sender_device` (see [`send_heartbeat`]) to force a DH-ratchet step.
+    pub heartbeat_due: bool,
+}
+
+// --- per-account store cache ------------------------------------------------
+
+fn cache() -> &'static Mutex<HashMap<i64, OmemoStores>> {
+    static C: OnceLock<Mutex<HashMap<i64, OmemoStores>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached(account_id: i64) -> Option<OmemoStores> {
+    cache().lock().unwrap().get(&account_id).cloned()
+}
+
+// --- session-establishment failure cache ------------------------------------
+//
+// Without this, `sessions_for` re-fetches (over PEP) and re-attempts establishment for every
+// device that has no session on *every* outgoing message. Since the hybrid post-quantum
+// identity is mandatory, any device whose published bundle predates it fails deterministically
+// and would otherwise be retried on each send — a burst of round-trips that delays (or, when it
+// leaves no usable device, blocks) the message. We mirror the Android client's `fetchStatusMap`
+// (`AxolotlService`), which marks such a device `FetchStatus.ERROR` and stops re-fetching it
+// until its device list republishes. This is a pure availability/freshness optimization: it only
+// suppresses *re-attempts*, never sends anything unencrypted/downgraded, and never touches
+// signature verification, the TOFU pin, or trust.
+
+/// How long a device whose session could not be established is skipped before we try its bundle
+/// again. (Android keeps the error until the device list republishes; we additionally cap it with
+/// this TTL so a re-keyed device recovers on its own.)
+const ESTABLISH_RETRY_BACKOFF: Duration = Duration::from_secs(600);
+
+type FailKey = (i64, String, u32);
+
+fn establish_failures() -> &'static Mutex<HashMap<FailKey, Instant>> {
+    static C: OnceLock<Mutex<HashMap<FailKey, Instant>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether we failed to establish a session with this device within the back-off window (so the
+/// caller should skip the bundle re-fetch this round). Expired entries are evicted on read.
+fn recently_failed(account_id: i64, jid: &str, device: u32) -> bool {
+    let mut m = establish_failures().lock().unwrap();
+    let key = (account_id, jid.to_string(), device);
+    match m.get(&key) {
+        Some(t) if t.elapsed() < ESTABLISH_RETRY_BACKOFF => true,
+        Some(_) => {
+            m.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+fn note_establish_failure(account_id: i64, jid: &str, device: u32) {
+    establish_failures()
+        .lock()
+        .unwrap()
+        .insert((account_id, jid.to_string(), device), Instant::now());
+}
+
+fn note_establish_success(account_id: i64, jid: &str, device: u32) {
+    establish_failures().lock().unwrap().remove(&(account_id, jid.to_string(), device));
+}
+
+/// Last device list we saw per (account, JID), so a *change* can clear that JID's failure
+/// entries — matching Android's `clearErrorsInFetchStatusMap` on a device-list update, so a
+/// newly added or rotated device is retried at once instead of waiting out the back-off.
+fn device_list_seen() -> &'static Mutex<HashMap<(i64, String), Vec<u32>>> {
+    static C: OnceLock<Mutex<HashMap<(i64, String), Vec<u32>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record the device list just fetched for `jid`; if it differs from last time, drop that JID's
+/// establish-failure entries so the changed set is re-evaluated immediately.
+fn refresh_device_list(account_id: i64, jid: &str, devices: &[u32]) {
+    let mut sorted = devices.to_vec();
+    sorted.sort_unstable();
+    let key = (account_id, jid.to_string());
+    let changed = {
+        let mut seen = device_list_seen().lock().unwrap();
+        let changed = seen.get(&key).map(|prev| prev != &sorted).unwrap_or(true);
+        seen.insert(key, sorted);
+        changed
+    };
+    if changed {
+        establish_failures()
+            .lock()
+            .unwrap()
+            .retain(|(a, j, _), _| !(*a == account_id && j == jid));
+    }
+}
+
+/// Forget all in-memory OMEMO2 establishment-failure and device-list snapshots for an account.
+/// Paired with [`mxc_store::Store::reset_omemo2_peer_state`] by the "reset OMEMO2 identities"
+/// action so peers are re-fetched and re-established immediately instead of waiting out the
+/// failure back-off.
+pub fn forget_caches(account_id: i64) {
+    establish_failures().lock().unwrap().retain(|(a, _, _), _| *a != account_id);
+    device_list_seen().lock().unwrap().retain(|(a, _), _| *a != account_id);
+    heartbeat_sent().lock().unwrap().retain(|(a, _, _), _| *a != account_id);
+}
+
+/// Drop the cached in-memory [`OmemoStores`] for an account, so the next OMEMO2 operation
+/// reloads the identity from disk — or, after [`regenerate_own_identity`] wiped it, generates
+/// a brand-new one. Without this, the old identity key pair would keep being used from memory.
+pub fn forget_stores(account_id: i64) {
+    cache().lock().unwrap().remove(&account_id);
+}
+
+/// Drop the establish-failure cache entries for a single peer, so the next outgoing message
+/// re-fetches their bundle and rebuilds the session immediately instead of waiting out the
+/// back-off. Called when we receive a message from them we cannot decrypt (e.g. a stale session
+/// after a one-sided OMEMO2 reset) — the standard self-healing trigger.
+pub fn forget_jid_failures(account_id: i64, jid: &str) {
+    establish_failures()
+        .lock()
+        .unwrap()
+        .retain(|(a, j, _), _| !(*a == account_id && j == jid));
+}
+
+/// Rate-limit window for [`heal_session`] per device, to avoid heal storms / handshake ping-pong.
+const HEAL_COOLDOWN: Duration = Duration::from_secs(300);
+
+fn heal_attempts() -> &'static Mutex<HashMap<FailKey, Instant>> {
+    static C: OnceLock<Mutex<HashMap<FailKey, Instant>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether we may heal this device now (and record the attempt). At most one per `HEAL_COOLDOWN`.
+fn may_heal(account_id: i64, jid: &str, device: u32) -> bool {
+    let mut m = heal_attempts().lock().unwrap();
+    let key = (account_id, jid.to_string(), device);
+    match m.get(&key) {
+        Some(t) if t.elapsed() < HEAL_COOLDOWN => false,
+        _ => {
+            m.insert(key, Instant::now());
+            true
+        }
+    }
+}
+
+/// Devices we already attempted a background pq_ik pin reconciliation for this app run (see
+/// [`reconcile_pq_pin_if_missing`]) — at most one bundle fetch per device per run, whether or
+/// not it succeeds, so a peer that never publishes a usable bundle cannot cause fetch loops.
+fn pq_pin_reconcile_attempts() -> &'static Mutex<HashSet<FailKey>> {
+    static C: OnceLock<Mutex<HashSet<FailKey>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// XEP-0384 heartbeat threshold: the first message received for a given ratchet key whose Double
+/// Ratchet counter reaches this value MUST be answered with a heartbeat (an empty OMEMO message),
+/// forcing a DH-ratchet step so the peer's next chain restarts at 0.
+const HEARTBEAT_COUNTER_THRESHOLD: u32 = 53;
+
+/// The sender ratchet key we last sent a heartbeat for, per peer device. Lets us honour the spec's
+/// "the *first* message for a given ratchet key" wording: we heartbeat once per receiving chain, so
+/// a burst of in-flight messages already past the threshold can't cause a heartbeat storm.
+fn heartbeat_sent() -> &'static Mutex<HashMap<FailKey, Vec<u8>>> {
+    static C: OnceLock<Mutex<HashMap<FailKey, Vec<u8>>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether a heartbeat is due for this peer device given a freshly-received message's
+/// `(counter, ratchet_key)`: true only when the counter is at/over the threshold AND we have not
+/// already heartbeated for this exact ratchet key. Records the ratchet key on a `true` result so
+/// the next message in the same chain is a no-op.
+fn heartbeat_due(account_id: i64, jid: &str, device: u32, counter: u32, ratchet_key: &[u8]) -> bool {
+    if counter < HEARTBEAT_COUNTER_THRESHOLD {
+        return false;
+    }
+    let mut m = heartbeat_sent().lock().unwrap();
+    let key = (account_id, jid.to_string(), device);
+    if m.get(&key).map(|prev| prev.as_slice() == ratchet_key).unwrap_or(false) {
+        return false;
+    }
+    m.insert(key, ratchet_key.to_vec());
+    true
+}
+
+/// Load (or first-time create) this account's OMEMO identity + stores.
+/// Returns `(stores, freshly_created)`.
+async fn load_or_create(store: &Store, cfg: &AccountConfig) -> anyhow::Result<(OmemoStores, bool)> {
+    if let Some(s) = cached(cfg.account_id) {
+        return Ok((s, false));
+    }
+    let dev = store.omemo_own_device_id(cfg.account_id).await?;
+    let id_bytes = secrets::retrieve(secrets::kinds::OMEMO_IDENTITY, &cfg.jid).await?;
+    let pq_bytes = secrets::retrieve(secrets::kinds::OMEMO_PQ_IDENTITY, &cfg.jid).await?;
+
+    let (stores, fresh) = match (dev, id_bytes) {
+        (Some(dev), Some(bytes)) => {
+            // Existing classical OMEMO2 identity. Add a post-quantum half if this install
+            // predates the hybrid identity — the classical identity (and its fingerprint)
+            // is untouched, so no re-verification is needed; the bundle simply gains a
+            // <pq-ik> on the next republish.
+            let pq_bytes = match pq_bytes {
+                Some(p) => p,
+                None => {
+                    let p = session::new_pq_identity_bytes();
+                    secrets::store(secrets::kinds::OMEMO_PQ_IDENTITY, &cfg.jid, &p).await?;
+                    p
+                }
+            };
+            let s = session::stores_from_identity(
+                store.clone(),
+                cfg.account_id,
+                &bytes,
+                &pq_bytes,
+                dev as u32,
+            )
+            .map_err(|e| anyhow::anyhow!("load omemo identity: {e}"))?;
+            store
+                .set_omemo_own_pq_identity_pub(cfg.account_id, &s.pq_identity_public_bytes())
+                .await?;
+            (s, false)
+        }
+        _ => {
+            let (identity_bytes, pq_identity_bytes, device_id) = session::new_identity_bytes();
+            secrets::store(secrets::kinds::OMEMO_IDENTITY, &cfg.jid, &identity_bytes).await?;
+            secrets::store(secrets::kinds::OMEMO_PQ_IDENTITY, &cfg.jid, &pq_identity_bytes).await?;
+            let s = session::stores_from_identity(
+                store.clone(),
+                cfg.account_id,
+                &identity_bytes,
+                &pq_identity_bytes,
+                device_id,
+            )
+            .map_err(|e| anyhow::anyhow!("create omemo identity: {e}"))?;
+            store
+                .set_omemo_own_identity(cfg.account_id, device_id as i64, &s.identity_public_bytes(), true)
+                .await?;
+            store
+                .set_omemo_own_pq_identity_pub(cfg.account_id, &s.pq_identity_public_bytes())
+                .await?;
+            store.set_omemo_device_id(cfg.account_id, device_id as i64).await?;
+            (s, true)
+        }
+    };
+    cache().lock().unwrap().insert(cfg.account_id, stores.clone());
+    Ok((stores, fresh))
+}
+
+async fn stores(store: &Store, cfg: &AccountConfig) -> anyhow::Result<OmemoStores> {
+    Ok(load_or_create(store, cfg).await?.0)
+}
+
+/// Our own OMEMO2 device id (registration id), advertised in JMI for OMEMO-verified calls.
+pub async fn own_device_id(store: &Store, cfg: &AccountConfig) -> anyhow::Result<u32> {
+    Ok(stores(store, cfg).await?.registration_id())
+}
+
+// --- bootstrap --------------------------------------------------------------
+
+/// Ensure our identity exists, our bundle is published, and our device id is in the
+/// device list. Called from bootstrap (best-effort).
+pub async fn ensure_initialized(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    _events: &Sender<Event>,
+) -> anyhow::Result<()> {
+    let device_id = maintain_and_republish(w, store, cfg).await?;
+    publish_device_list(w, cfg, device_id).await?;
+    Ok(())
+}
+
+/// LAST-RESORT full identity regeneration (the desktop counterpart of Android's
+/// "Delete OMEMO identities"): wipe our own hybrid identity — classical + ML-DSA-87 key
+/// pairs, device id, every pre-key — plus all peer state, then generate and publish a
+/// brand-new identity. This device gets a NEW fingerprint; contacts MUST verify it again.
+///
+/// Order matters: capture the old device id first (to retract its bundle and prune it from
+/// the PEP device list), wipe disk state, delete the private-key secrets, drop the in-memory
+/// stores (else the old key pair would keep being used from cache), and only then
+/// re-initialize — `load_or_create` sees no own-identity row and mints a fresh identity.
+pub async fn regenerate_own_identity(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+) -> anyhow::Result<()> {
+    let old_device = store
+        .omemo_own_device_id(cfg.account_id)
+        .await?
+        .map(|d| d as u32);
+    warn!(account = cfg.account_id, old_device, "omemo: REGENERATING own identity (last resort)");
+    store.reset_omemo2_own_state(cfg.account_id).await?;
+    store.reset_omemo2_peer_state(cfg.account_id).await?;
+    // Belt and braces: load_or_create would overwrite these anyway once the own-identity row
+    // is gone, but a possibly compromised private key should not linger in the keyring for
+    // even a moment longer than necessary.
+    let _ = secrets::delete(secrets::kinds::OMEMO_IDENTITY, &cfg.jid).await;
+    let _ = secrets::delete(secrets::kinds::OMEMO_PQ_IDENTITY, &cfg.jid).await;
+    forget_stores(cfg.account_id);
+    forget_caches(cfg.account_id);
+    // Retract the old bundle so peers can no longer fetch the retired (possibly compromised)
+    // key material. Best-effort: the node item may already be gone.
+    if let Some(old) = old_device {
+        let _ = pep::retract(w, NODE_BUNDLES, &old.to_string()).await;
+    }
+    // Mint + publish the new identity, and swap the old device id for the new one in the
+    // device list (other devices on the account are preserved).
+    let device_id = maintain_and_republish(w, store, cfg).await?;
+    publish_device_list_replacing(w, cfg, device_id, old_device).await?;
+    Ok(())
+}
+
+/// (Re)build the bundle from the keys we currently hold — generating the initial set on
+/// first use, and topping up one-time pre-keys when low — then publish it. Keeps the
+/// advertised bundle in sync with what's actually usable. Returns our device id.
+pub async fn maintain_and_republish(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+) -> anyhow::Result<u32> {
+    let stores = stores(store, cfg).await?;
+    let device_id = stores.registration_id();
+    let bundle = session::maintain_bundle(
+        &stores,
+        SIGNED_PREKEY_ID,
+        KEM_SIGNED_ID,
+        FIRST_PREKEY_ID,
+        PREKEY_COUNT,
+        PREKEY_LOW_WATER,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("maintain bundle: {e}"))?;
+    debug!(
+        device_id,
+        has_pq_identity = bundle.has_pq_identity(),
+        pq_ik_len = bundle.pq_ik.len(),
+        ec_prekeys = bundle.prekeys.len(),
+        "omemo: (re)publishing own bundle"
+    );
+    store.set_omemo_bundle_xml(cfg.account_id, &bundle.to_xml()).await?;
+    publish_bundle(w, device_id, &bundle).await?;
+    Ok(device_id)
+}
+
+async fn publish_bundle(w: &Writer, device_id: u32, bundle: &Bundle) -> anyhow::Result<()> {
+    publish_bundle_xml(w, device_id, &bundle.to_xml()).await
+}
+
+async fn publish_bundle_xml(w: &Writer, device_id: u32, xml: &str) -> anyhow::Result<()> {
+    let payload: Element = xml.parse().map_err(|e| anyhow::anyhow!("serialize bundle: {e}"))?;
+    pep::publish(
+        w,
+        NODE_BUNDLES,
+        Some(&device_id.to_string()),
+        payload,
+        Some(pep::publish_options("open")),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn publish_device_list(w: &Writer, cfg: &AccountConfig, device_id: u32) -> anyhow::Result<()> {
+    publish_device_list_replacing(w, cfg, device_id, None).await
+}
+
+/// Publish our account's OMEMO2 device list containing `device_id`, optionally dropping
+/// `remove` (our previous device id after an identity regeneration — its bundle is gone, so
+/// leaving it advertised would make peers try, and fail, to encrypt to it). Other devices'
+/// ids are preserved.
+async fn publish_device_list_replacing(
+    w: &Writer,
+    cfg: &AccountConfig,
+    device_id: u32,
+    remove: Option<u32>,
+) -> anyhow::Result<()> {
+    let mut ids = fetch_device_list(w, cfg.bare()).await.unwrap_or_default();
+    if let Some(old) = remove {
+        ids.retain(|id| *id != old);
+    }
+    if !ids.contains(&device_id) {
+        ids.push(device_id);
+    }
+    let mut devices = Element::builder("devices", NS_OMEMO2);
+    for id in &ids {
+        devices = devices.append(Element::builder("device", NS_OMEMO2).attr(crate::ncname("id"), id.to_string()).build());
+    }
+    pep::publish(w, NODE_DEVICES, Some("current"), devices.build(), Some(pep::publish_options("open")))
+        .await?;
+    Ok(())
+}
+
+// --- fetch ------------------------------------------------------------------
+
+async fn fetch_device_list(w: &Writer, jid: &str) -> anyhow::Result<Vec<u32>> {
+    let reply = pep::items(w, Some(jid), NODE_DEVICES, Some(1)).await?;
+    let mut out = Vec::new();
+    for (_, payload) in pep::extract_items(&reply) {
+        if payload.name() == "devices" {
+            for d in payload.children().filter(|c| c.name() == "device") {
+                if let Some(id) = d.attr("id").and_then(|s| s.parse::<u32>().ok()) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+async fn fetch_bundle(w: &Writer, jid: &str, device: u32) -> anyhow::Result<Bundle> {
+    let reply = pep::item(w, Some(jid), NODE_BUNDLES, &device.to_string()).await?;
+    let (_, payload) = pep::extract_items(&reply)
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no bundle for {jid}/{device}"))?;
+    Bundle::from_xml(&String::from(&payload)).map_err(|e| anyhow::anyhow!("parse bundle: {e}"))
+}
+
+/// Fetch `jid`'s device list and ensure a session exists for each device, returning the
+/// addresses we can encrypt to. Devices whose bundle can't be fetched are skipped.
+async fn sessions_for(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    stores: &OmemoStores,
+    jid: &str,
+    our_device: u32,
+) -> anyhow::Result<Vec<DeviceAddr>> {
+    let devices = fetch_device_list(w, jid).await.unwrap_or_default();
+    // Clear stale failure entries for this JID if its device list changed (Android parity).
+    refresh_device_list(cfg.account_id, jid, &devices);
+    let mut out = Vec::new();
+    for dev in devices {
+        if jid == cfg.bare() && dev == our_device {
+            continue; // never encrypt to ourselves
+        }
+        let addr = DeviceAddr { jid: jid.to_string(), device_id: dev };
+        let has_session = store
+            .load_omemo_session(cfg.account_id, jid, dev as i64)
+            .await?
+            .is_some();
+        if !has_session {
+            // Skip a device whose session establishment recently failed (e.g. its published
+            // bundle has no post-quantum identity, or no bundle at all), so we don't re-fetch
+            // it on every send.
+            if recently_failed(cfg.account_id, jid, dev) {
+                debug!(%jid, dev, "omemo: skipping device (recent establish failure cached)");
+                continue;
+            }
+            match fetch_bundle(w, jid, dev).await {
+                Ok(bundle) => {
+                    match session::establish_session(stores, cfg.bare(), our_device, &addr, &bundle)
+                        .await
+                    {
+                        Ok(()) => {
+                            debug!(%jid, dev, "omemo: session established");
+                            note_establish_success(cfg.account_id, jid, dev);
+                        }
+                        Err(e) => {
+                            warn!(%jid, dev, error = %e, "omemo: session establishment failed");
+                            note_establish_failure(cfg.account_id, jid, dev);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(%jid, dev, error = %e, "omemo: bundle fetch/parse failed");
+                    note_establish_failure(cfg.account_id, jid, dev);
+                    continue;
+                }
+            }
+        }
+        // Only encrypt to *trusted* devices: trust == 1 (BTBV-trusted) or trust == 3 (manually
+        // verified). Establishing the session above saved the identity with its initial trust
+        // (1 if "auto-trust new keys" is on, else 0 = undecided); undecided (0) / untrusted (2)
+        // devices are skipped until the user enables them.
+        let trusted = store
+            .omemo_identity(cfg.account_id, jid, dev as i64)
+            .await?
+            .map(|id| id.trust == 1 || id.trust == 3)
+            .unwrap_or(false);
+        if trusted {
+            out.push(addr);
+        } else {
+            debug!(%jid, dev, "omemo: device has a session but is not trusted — not encrypting to it");
+        }
+    }
+    debug!(%jid, usable_devices = out.len(), "omemo: sessions_for done");
+    Ok(out)
+}
+
+// --- encrypt / decrypt ------------------------------------------------------
+
+/// Encrypt an SCE envelope for `to_bare` (+ our own other devices) and return the
+/// `<encrypted>` element ready to attach to a message.
+pub async fn encrypt_for(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    to_bare: &str,
+    envelope_xml: &[u8],
+) -> anyhow::Result<Element> {
+    // 1:1: the single recipient is also the payload context-binding recipient (§5.4.2).
+    encrypt_for_recipients(w, store, cfg, &[to_bare.to_string()], Some(to_bare), envelope_xml).await
+}
+
+/// Encrypt an SCE envelope for every bare JID in `recipients` (+ our own other devices) and
+/// return the `<encrypted>` element. Used both for 1:1 (a single recipient) and for an
+/// encrypted MUC (one entry per room member's real bare JID — see `muc_member_jids`). Devices
+/// whose bundle can't be fetched, or that aren't trusted, are skipped; if that leaves no
+/// recipient at all the call fails so we never send an undeliverable ciphertext.
+///
+/// `binding_to` is the single recipient bare JID bound into the payload's context binding
+/// (§5.4.2) — the counterpart for a 1:1 or the room JID for a MUC (i.e. the SCE `<to>`), or
+/// `None` when it can't be canonicalised (a MUC private message), matching the receiver.
+pub async fn encrypt_for_recipients(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    recipients: &[String],
+    binding_to: Option<&str>,
+    envelope_xml: &[u8],
+) -> anyhow::Result<Element> {
+    let stores = stores(store, cfg).await?;
+    let our_device = stores.registration_id();
+
+    let mut addrs = Vec::new();
+    for jid in recipients {
+        // Our own bare JID is handled once below (sessions_for skips our sending device).
+        if jid.eq_ignore_ascii_case(cfg.bare()) {
+            continue;
+        }
+        addrs.extend(sessions_for(w, store, cfg, &stores, jid, our_device).await?);
+    }
+    // Devices of the actual recipient(s), counted BEFORE our own are added: the check below has
+    // to be "did we wrap for anyone we are writing to", not "did we wrap for anyone at all"
+    // (proto-XEP §4.6.9). sessions_for() drops untrusted and unreachable devices, so a peer whose
+    // devices are all untrusted contributes nothing — and with another device of our own in the
+    // list the send would still have gone out, readable by us alone, and been reported as sent
+    // while the peer saw a "not encrypted for this device" placeholder.
+    let recipient_devices = addrs.len();
+    // Always also encrypt to our own other devices so they (and carbons) can decrypt.
+    addrs.extend(sessions_for(w, store, cfg, &stores, cfg.bare(), our_device).await?);
+
+    // Note-to-self parity with Android (`acceptEmpty` for `isSelf()` chats): when the only
+    // recipient is our own account, permit an *empty* recipient set so a single-device self-note
+    // still sends. The payload is still sealed; the `<header>` just carries no `<key>` until we
+    // own another device (later self-notes then wrap to it normally). For any other recipient we
+    // keep refusing to emit ciphertext that nobody can read.
+    let note_to_self =
+        !recipients.is_empty() && recipients.iter().all(|j| j.eq_ignore_ascii_case(cfg.bare()));
+    if recipient_devices == 0 && !note_to_self {
+        anyhow::bail!("no trusted OMEMO2 device for the recipient(s)");
+    }
+
+    let enc = session::encrypt(&stores, cfg.bare(), our_device, &addrs, binding_to, envelope_xml)
+        .await
+        .map_err(|e| anyhow::anyhow!("omemo encrypt: {e}"))?;
+    Ok(build_encrypted(&enc, our_device))
+}
+
+/// Build the OMEMO2 `<header sid><keys jid><key rid kex>…` element (the wrapped per-device keys).
+fn build_header(enc: &EncryptedMessage, sender_device: u32) -> Element {
+    let mut by_jid: BTreeMap<&str, Vec<&WrappedKey>> = BTreeMap::new();
+    for k in &enc.keys {
+        by_jid.entry(k.jid.as_str()).or_default().push(k);
+    }
+
+    let mut header = Element::builder("header", NS_OMEMO2).attr(crate::ncname("sid"), sender_device.to_string());
+    for (jid, ks) in by_jid {
+        let mut keys_el = Element::builder("keys", NS_OMEMO2).attr(crate::ncname("jid"), jid);
+        for k in ks {
+            let mut key_el = Element::builder("key", NS_OMEMO2).attr(crate::ncname("rid"), k.device_id.to_string());
+            if k.kex {
+                key_el = key_el.attr(crate::ncname("kex"), "true");
+            }
+            keys_el = keys_el.append(key_el.append(B64.encode(&k.data)).build());
+        }
+        header = header.append(keys_el.build());
+    }
+    header.build()
+}
+
+/// Build the full `<encrypted xmlns='urn:monocles:omemo-pq:1'>` element (header + `<payload>` +
+/// `<commit>`). The `<commit>` is the single shared key commitment (proto-XEP §5.5) that makes the
+/// AEAD key-committing; receivers verify it before opening the payload.
+fn build_encrypted(enc: &EncryptedMessage, sender_device: u32) -> Element {
+    Element::builder("encrypted", NS_OMEMO2)
+        .append(build_header(enc, sender_device))
+        .append(Element::builder("payload", NS_OMEMO2).append(B64.encode(&enc.payload)).build())
+        .append(Element::builder("commit", NS_OMEMO2).append(B64.encode(enc.commit)).build())
+        .build()
+}
+
+/// Encrypt an **empty SCE envelope** (no body, no metadata) to `addr` and build the OMEMO2
+/// `<encrypted>` element *with* a `<payload>`. Used for both session heals and XEP-0384
+/// heartbeats.
+///
+/// We deliberately send a payload-bearing empty message rather than a header-only (`<payload>`-less)
+/// one: the Android reference client drops any OMEMO2 stanza that carries no `<payload>`
+/// (`MessageParser` returns early on `!hasPayload()`), so a header-only message would never reach
+/// its ratchet — the heal/heartbeat would be a silent no-op against an Android peer. The decrypted
+/// envelope is empty (no `<body>`), so receivers process the key/ratchet but create no visible
+/// message. The envelope still carries the §4.6.1 `<from>`/`<to>` binding.
+async fn build_empty_omemo2(
+    stores: &OmemoStores,
+    cfg: &AccountConfig,
+    our_device: u32,
+    peer_bare: &str,
+    addr: DeviceAddr,
+) -> anyhow::Result<Element> {
+    let env =
+        Envelope::with_content("", cfg.bare(), peer_bare, Some(crate::xeps::rfc3339_now()));
+    let enc = session::encrypt(
+        stores,
+        cfg.bare(),
+        our_device,
+        &[addr],
+        Some(peer_bare),
+        env.to_xml().as_bytes(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("omemo empty-message encrypt: {e}"))?;
+    Ok(build_encrypted(&enc, our_device))
+}
+
+/// EME hint to attach alongside an `<encrypted>` element.
+pub fn eme_hint() -> Element {
+    Element::builder("encryption", NS_EME)
+        .attr(crate::ncname("name"), "PQ-OMEMO2")
+        .attr(crate::ncname("namespace"), NS_OMEMO2)
+        .build()
+}
+
+/// Recover a broken/stale inbound session with a peer device: (re)establish a fresh outbound
+/// session from its published bundle and send it an **empty OMEMO2 message** (an empty SCE
+/// envelope, `<payload>` present — see [`build_empty_omemo2`]), so the peer adopts the new session
+/// and its next message decrypts — even if we never send it a normal message ourselves. Mirrors the
+/// Android client's `completeOmemo2Session`. Called best-effort when an inbound message fails to
+/// decrypt.
+///
+/// Security: this never weakens messaging. The re-established identity is authenticated by the
+/// bundle's ML-DSA-87 signature and TOFU-pinned inside `establish_session` (no downgrade, mandatory
+/// PQ identity still enforced); we only re-handshake to a **trusted** device (trust 1 or 3), so a
+/// blind-trust-off user is never silently re-paired to an unverified key; the message carries **no
+/// plaintext**; and it is rate-limited per device to prevent heal storms.
+pub async fn heal_session(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    sender_bare: &str,
+    sender_device: u32,
+) -> anyhow::Result<()> {
+    if !may_heal(cfg.account_id, sender_bare, sender_device) {
+        return Ok(());
+    }
+    let stores = stores(store, cfg).await?;
+    let our_device = stores.registration_id();
+    if sender_bare == cfg.bare() && sender_device == our_device {
+        return Ok(()); // never heal toward ourselves
+    }
+    let addr = DeviceAddr { jid: sender_bare.to_string(), device_id: sender_device };
+
+    // Re-fetch the bundle and (re)establish a fresh outbound session (libsignal archives the old).
+    forget_jid_failures(cfg.account_id, sender_bare);
+    let bundle = match fetch_bundle(w, sender_bare, sender_device).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%sender_bare, sender_device, error = %e, "omemo: heal — no bundle, cannot re-establish");
+            note_establish_failure(cfg.account_id, sender_bare, sender_device);
+            return Ok(());
+        }
+    };
+    if let Err(e) =
+        session::establish_session(&stores, cfg.bare(), our_device, &addr, &bundle).await
+    {
+        warn!(%sender_bare, sender_device, error = %e, "omemo: heal — re-establish failed");
+        note_establish_failure(cfg.account_id, sender_bare, sender_device);
+        return Ok(());
+    }
+
+    // Respect trust: only re-handshake to a device we actually encrypt to.
+    let trusted = store
+        .omemo_identity(cfg.account_id, sender_bare, sender_device as i64)
+        .await?
+        .map(|id| id.trust == 1 || id.trust == 3)
+        .unwrap_or(false);
+    if !trusted {
+        debug!(%sender_bare, sender_device, "omemo: heal — device not trusted, not sending empty message");
+        return Ok(());
+    }
+
+    // Encrypt an empty SCE envelope to just this device (a `<key kex>` + `<payload>`); decrypting
+    // it re-establishes/advances the peer's session, with no visible message.
+    let enc_el = build_empty_omemo2(&stores, cfg, our_device, sender_bare, addr).await?;
+    let msg = Element::builder("message", NS_CLIENT)
+        .attr(crate::ncname("to"), sender_bare)
+        .attr(crate::ncname("type"), "chat")
+        .attr(crate::ncname("id"), new_id("heal"))
+        .append(enc_el)
+        .append(eme_hint())
+        .append(Element::builder("no-store", NS_HINTS).build())
+        .build();
+    w.send(msg)?;
+    info!(%sender_bare, sender_device, "omemo: sent empty OMEMO2 message to heal broken session");
+    Ok(())
+}
+
+/// Background pq_ik pin reconciliation (mirror of the Android client). A peer's post-quantum
+/// identity is normally pinned when WE establish the session from its fetched bundle
+/// ([`session::establish_session`]). When the PEER initiated the session, the inbound PQXDH key
+/// exchange never delivers its `<pq-ik>` (it only travels in the published bundle), so no pin is
+/// ever written and [`sessions_for`] never fetches the bundle again once a session exists — the
+/// device then shows its classical instead of hybrid fingerprint indefinitely. Called
+/// best-effort after every successful inbound OMEMO2 decrypt: if no pq_ik is pinned for the
+/// sender's classical identity yet, fetch its bundle once (per device, per app run), verify it,
+/// and pin ([`session::reconcile_pq_pin`] — same ML-DSA-87 transcript verification as an
+/// outbound establish, bundle identity must match the known one, and an existing pin is never
+/// overwritten).
+pub async fn reconcile_pq_pin_if_missing(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    sender_bare: &str,
+    sender_device: u32,
+) -> anyhow::Result<()> {
+    let stores = stores(store, cfg).await?;
+    if sender_bare == cfg.bare() && sender_device == stores.registration_id() {
+        return Ok(()); // never reconcile toward ourselves
+    }
+    // At most one attempt per device per app run, whether or not it succeeds.
+    {
+        let mut m = pq_pin_reconcile_attempts().lock().unwrap();
+        if !m.insert((cfg.account_id, sender_bare.to_string(), sender_device)) {
+            return Ok(());
+        }
+    }
+    // The sender's classical identity key, as saved by the (inbound) session establishment.
+    let Some(rec) = store
+        .omemo_identity(cfg.account_id, sender_bare, sender_device as i64)
+        .await?
+    else {
+        return Ok(());
+    };
+    let pin_key = mxc_omemo::pq_pin_key(&rec.identity_key);
+    if store
+        .get_pinned_omemo2_pq_identity(cfg.account_id, &pin_key)
+        .await?
+        .is_some()
+    {
+        return Ok(()); // already pinned
+    }
+    debug!(%sender_bare, sender_device, "omemo: no pq_ik pinned — fetching bundle to reconcile");
+    let bundle = match fetch_bundle(w, sender_bare, sender_device).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(%sender_bare, sender_device, error = %e,
+                "omemo: pq pin reconciliation — bundle fetch failed");
+            return Ok(());
+        }
+    };
+    let addr = DeviceAddr { jid: sender_bare.to_string(), device_id: sender_device };
+    match session::reconcile_pq_pin(&stores, &addr, &bundle, &rec.identity_key).await {
+        Ok(true) => {
+            info!(%sender_bare, sender_device, "omemo: pq pin reconciliation — pinned PQ identity");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(%sender_bare, sender_device, error = %e,
+                "omemo: pq pin reconciliation — refused, not pinning");
+        }
+    }
+    Ok(())
+}
+
+/// Send an XEP-0384 **heartbeat**: an empty OMEMO2 message to `sender_device` over the *existing*
+/// session (we just decrypted one of its messages, so a session is already established — unlike
+/// [`heal_session`], we never re-fetch a bundle). Encrypting empty content advances our sending
+/// chain and carries a fresh ratchet key, so when the peer receives it they perform a DH-ratchet
+/// step and their next chain restarts at counter 0. Called when an inbound message's counter
+/// reaches the heartbeat threshold (see [`heartbeat_due`]).
+///
+/// Security: identical envelope to a heal — an **empty SCE envelope** (no body, no metadata), sent
+/// **only to a trusted device** (trust 1 or 3), and at most once per receiving ratchet key. It
+/// strictly improves the ratchet's post-compromise security in one-directional conversations and
+/// never downgrades or re-pairs anything.
+pub async fn send_heartbeat(
+    w: &Writer,
+    store: &Store,
+    cfg: &AccountConfig,
+    sender_bare: &str,
+    sender_device: u32,
+) -> anyhow::Result<()> {
+    let stores = stores(store, cfg).await?;
+    let our_device = stores.registration_id();
+    if sender_bare == cfg.bare() && sender_device == our_device {
+        return Ok(()); // never heartbeat toward ourselves
+    }
+    // Only emit an (encrypted, empty) message to a device we actually trust to encrypt to.
+    let trusted = store
+        .omemo_identity(cfg.account_id, sender_bare, sender_device as i64)
+        .await?
+        .map(|id| id.trust == 1 || id.trust == 3)
+        .unwrap_or(false);
+    if !trusted {
+        debug!(%sender_bare, sender_device, "omemo: heartbeat — device not trusted, skipping");
+        return Ok(());
+    }
+    let addr = DeviceAddr { jid: sender_bare.to_string(), device_id: sender_device };
+    let enc_el = build_empty_omemo2(&stores, cfg, our_device, sender_bare, addr).await?;
+    let msg = Element::builder("message", NS_CLIENT)
+        .attr(crate::ncname("to"), sender_bare)
+        .attr(crate::ncname("type"), "chat")
+        .attr(crate::ncname("id"), new_id("hb"))
+        .append(enc_el)
+        .append(eme_hint())
+        .append(Element::builder("no-store", NS_HINTS).build())
+        .build();
+    w.send(msg)?;
+    info!(%sender_bare, sender_device, "omemo: sent XEP-0384 heartbeat (ratchet counter ≥ threshold)");
+    Ok(())
+}
+
+/// Does a `<keys jid='…'>` block address us?
+///
+/// A plain `==` against our bare JID was too strict: XMPP localparts and domains are both
+/// case-insensitive (PRECIS UsernameCaseMapped / IDNA), so a peer writing `Alice@Example.com`
+/// addresses the same account — and Android accepts it, since it compares parsed bare JIDs. The
+/// desktop dropped the message with "no key for our device" instead. Being lenient here is not a
+/// loosening: the value is compared against *our own* JID, and case-folding is what the JID
+/// equality rules already require. ASCII case folding (rather than full PRECIS) matches how the
+/// rest of this crate compares JIDs, including `Envelope::verify_binding`.
+fn keys_block_is_ours(jid_attr: Option<&str>, our_bare: &str) -> bool {
+    let Some(jid) = jid_attr else { return false };
+    let bare = jid.split('/').next().unwrap_or(jid);
+    bare.eq_ignore_ascii_case(our_bare)
+}
+
+/// Decrypt an incoming `<encrypted>` element addressed to us from `sender_bare`.
+///
+/// `expected_to` is the recipient bare JID the sender is expected to have bound into the payload
+/// context (§5.4.2) — our own bare JID for an incoming 1:1, the counterpart for a carbon of our
+/// own send, the room JID for a MUC, `None` for a MUC private message. It must match the value
+/// later checked against the SCE `<to>`; GCM decryption fails otherwise.
+pub async fn decrypt_message(
+    store: &Store,
+    cfg: &AccountConfig,
+    events: &Sender<Event>,
+    encrypted: &Element,
+    sender_bare: &str,
+    expected_to: Option<&str>,
+) -> anyhow::Result<Decrypted> {
+    let header = encrypted
+        .get_child("header", NS_OMEMO2)
+        .ok_or_else(|| anyhow::anyhow!("omemo: no <header>"))?;
+    let sender_device: u32 = header
+        .attr("sid")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("omemo: bad sid"))?;
+    // A missing `<payload>` is a key-transport message (used to re-sync a broken session): we
+    // still process the wrapped key (which (re)establishes the session) but there is no content.
+    let is_key_transport = encrypted.get_child("payload", NS_OMEMO2).is_none();
+    let payload = match encrypted.get_child("payload", NS_OMEMO2) {
+        Some(p) => B64.decode(p.text().trim())?,
+        None => Vec::new(),
+    };
+    // Single shared key commitment (proto-XEP §5.5); verified against the unwrapped key inside
+    // session::decrypt. Absent on a key-transport message (no payload); required with a payload.
+    let commit = encrypted
+        .get_child("commit", NS_OMEMO2)
+        .map(|c| B64.decode(c.text().trim()))
+        .transpose()?;
+
+    let stores = stores(store, cfg).await?;
+    let our_device = stores.registration_id();
+
+    // Only consider the <keys> block addressed to us (XEP-0420 §4.6.4) — a sender must not be
+    // able to smuggle a key for our device in under another user's block.
+    let our_rid = our_device.to_string();
+    let candidates: Vec<(Vec<u8>, bool)> = header
+        .children()
+        .filter(|c| c.name() == "keys" && keys_block_is_ours(c.attr("jid"), cfg.bare()))
+        .flat_map(|keys| keys.children().filter(|c| c.name() == "key"))
+        .filter(|k| k.attr("rid") == Some(our_rid.as_str()))
+        .filter_map(|k| {
+            B64.decode(k.text().trim()).ok().map(|w| (w, k.attr("kex") == Some("true")))
+        })
+        .collect();
+    if candidates.is_empty() {
+        anyhow::bail!("omemo: no key for our device {our_device}");
+    }
+
+    let from = DeviceAddr { jid: sender_bare.to_string(), device_id: sender_device };
+    // A header may legitimately carry more than one wrap for us — e.g. a sender that rebuilt the
+    // session mid-send and attached both the old and the new one. Try each and keep the first
+    // that opens (mirrors Android's processReceiving, which walks its candidate list the same
+    // way).
+    //
+    // Retry only past a *wrapped-key* failure. `session::decrypt` advances and stores the ratchet
+    // before it touches the payload, so a payload-layer failure — `OmemoError::Aead`: key
+    // commitment mismatch, GCM tag mismatch, bad key length — means the key unwrapped fine and
+    // the ciphertext beside it did not verify. That is a tampering signal, not the wrong wrap,
+    // and it is final: continuing would spend another ratchet step per attempt on one stanza,
+    // handing an attacker extra bites at the session for free.
+    let mut opened = None;
+    let mut last_err = None;
+    for (candidate, candidate_kex) in candidates {
+        match session::decrypt(
+            &stores,
+            cfg.bare(),
+            our_device,
+            &from,
+            expected_to,
+            &candidate,
+            candidate_kex,
+            &payload,
+            commit.as_deref(),
+        )
+        .await
+        {
+            Ok(env) => {
+                opened = Some((env, candidate, candidate_kex));
+                break;
+            }
+            Err(e @ mxc_omemo::OmemoError::Aead(_)) => {
+                last_err = Some(e);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let (envelope, wrapped, kex) = match opened {
+        Some(v) => v,
+        None => {
+            let e = last_err.expect("non-empty candidate list always records an error");
+            return Err(anyhow::anyhow!("omemo decrypt: {e}"));
+        }
+    };
+
+    // XEP-0384 heartbeat: if this whisper's ratchet counter reached the threshold (a long
+    // one-directional chain), flag a heartbeat so the caller forces a DH-ratchet step — restoring
+    // break-in recovery and bounding skipped-key storage. Once per ratchet key; kex/key-transport
+    // messages never qualify (fresh chain / no counter).
+    let heartbeat_due = session::whisper_ratchet_counter(&wrapped, kex)
+        .map(|(counter, ratchet_key)| {
+            self::heartbeat_due(cfg.account_id, sender_bare, sender_device, counter, &ratchet_key)
+        })
+        .unwrap_or(false);
+
+    // Fingerprint + TOFU prompt for the sending device.
+    let fingerprint = match store
+        .omemo_identity(cfg.account_id, sender_bare, sender_device as i64)
+        .await?
+    {
+        Some(rec) => mxc_omemo::fingerprint(&rec.identity_key),
+        None => String::new(),
+    };
+    let _ = events
+        .send(Event::OmemoDeviceSeen {
+            account_id: cfg.account_id,
+            jid: sender_bare.to_string(),
+            device_id: sender_device as i64,
+            fingerprint: fingerprint.clone(),
+        })
+        .await;
+
+    Ok(Decrypted {
+        envelope,
+        sender_device,
+        fingerprint,
+        was_kex: kex,
+        key_transport: is_key_transport,
+        heartbeat_due,
+    })
+}
+
+#[cfg(test)]
+mod keys_block_tests {
+    use super::keys_block_is_ours;
+
+    /// XMPP JID equality folds case in both the localpart and the domain, and Android compares
+    /// parsed bare JIDs — so a peer writing `Alice@Example.com` addresses us. The desktop used
+    /// `==` and dropped those messages with "no key for our device".
+    #[test]
+    fn case_and_resource_are_ignored() {
+        assert!(keys_block_is_ours(Some("alice@example.com"), "alice@example.com"));
+        assert!(keys_block_is_ours(Some("Alice@Example.COM"), "alice@example.com"));
+        assert!(keys_block_is_ours(Some("alice@example.com/phone"), "alice@example.com"));
+    }
+
+    /// The block still has to be *ours*: this check is what stops a sender stuffing a key for
+    /// our device in under another user's `<keys>` block (XEP-0420 §4.6.4).
+    #[test]
+    fn another_jid_is_still_refused() {
+        assert!(!keys_block_is_ours(Some("mallory@example.com"), "alice@example.com"));
+        assert!(!keys_block_is_ours(Some("alice@evil.test"), "alice@example.com"));
+        assert!(!keys_block_is_ours(Some(""), "alice@example.com"));
+        assert!(!keys_block_is_ours(None, "alice@example.com"));
+    }
+}

@@ -1,0 +1,55 @@
+[package]
+name = "mxc-app-qt"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "monocles chat — Qt/QML desktop front-end (Linux/Windows/macOS)"
+default-run = "monocles-chat-qt"
+
+[[bin]]
+name = "monocles-chat-qt"
+path = "src/main.rs"
+
+[dependencies]
+# Shared XMPP/crypto/storage backend, now vendored into this workspace (crates/mxc-*) so the
+# Qt project builds independently of the GTK one. Keep in sync with the GTK copies.
+mxc-proto = { path = "../mxc-proto" }
+mxc-store = { path = "../mxc-store" }
+# Camera/audio (GStreamer) engine — used directly for the camera-device picker (enumerate +
+# set the preferred device); the call pipelines themselves are driven through mxc-proto.
+mxc-media = { path = "../mxc-media" }
+
+# Rust <-> Qt bridge (KDAB CXX-Qt). cxx-qt-lib brings QGuiApplication/QQmlApplicationEngine
+# and the Q* value types (QString, QUrl, …).
+cxx = "1"
+cxx-qt = "0.9.1"
+cxx-qt-lib = { version = "0.9.1", features = ["qt_full"] }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+async-channel = "2"
+# Cross-platform data/config dirs (replaces the GTK app's glib::user_data_dir()).
+directories = "6"
+anyhow = "1"
+# Local-date grouping of message timestamps (date separators).
+chrono = { workspace = true }
+# Voice-message recording + audio playback (reuses the GStreamer stack the calls use).
+gstreamer = { workspace = true }
+# Decode/scale/JPEG-encode call video frames for the data-URL preview (no GStreamer dep);
+# png/webp/gif decode is for user-picked avatar photos (XEP-0084) — scaled to JPEG, or
+# published raw when animated (gif/webp) like monocles Android.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+base64 = "0.22"
+# Extract `.xdc` (zip) WebXDC app bundles before serving them to the embedded web view.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+# Parse the WebXDC JS bridge messages (sendUpdate/sendToChat payloads).
+serde_json = "1"
+# Render our own verification URI as a QR code (pure Rust, no image/SVG plugin needed: QML
+# draws the module matrix on a Canvas).
+qrcode = { version = "0.14", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+# `link_qt_object_files` is required for a binary target so the QML-registered Rust
+# types (the `Backend` QObject) are linked into the final executable.
+cxx-qt-build = { version = "0.9.1", features = ["link_qt_object_files"] }

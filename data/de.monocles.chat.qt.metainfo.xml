@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>de.monocles.chat.qt</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>monocles chat</name>
+  <summary>Encrypted XMPP messaging with post-quantum PQ OMEMO2</summary>
+
+  <description>
+    <p>
+      monocles chat is a cross-platform Qt/QML XMPP client, wire- and feature-compatible
+      with monocles chat for Android. Conversations are protected with post-quantum
+      PQ OMEMO2 (PQXDH + SPQR) end-to-end encryption, and the local database is
+      encrypted at rest with SQLCipher.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Post-quantum end-to-end encryption (PQ OMEMO2)</li>
+      <li>1:1 and group chats, reactions, replies, corrections, retraction and read markers</li>
+      <li>Audio and video calls (XEP-0166/0353 Jingle over GStreamer WebRTC)</li>
+      <li>Voice messages, stickers, encrypted file sharing, Stories and social Feeds</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">de.monocles.chat.qt.desktop</launchable>
+
+  <developer id="eu.monocles">
+    <name>monocles</name>
+  </developer>
+
+  <url type="homepage">https://codeberg.org/monocles/monocles-chat-desktop</url>
+
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-audio">intense</content_attribute>
+  </content_rating>
+
+  <releases>
+    <release version="0.1.0" date="2026-06-11">
+      <description>
+        <p>Initial packaged release of the Qt client.</p>
+      </description>
+    </release>
+  </releases>
+</component>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Outlined smiley (add-reaction trigger), from monocles chat. White → tinted via ColorIcon. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <g fill="none" stroke="#ffffff" stroke-width="1.1" stroke-linecap="round">
+    <circle cx="8" cy="8" r="6.35"/>
+    <path d="M5.3 9.4a3 3 0 0 0 5.4 0"/>
+  </g>
+  <g fill="#ffffff">
+    <circle cx="5.9" cy="6.7" r="0.95"/>
+    <circle cx="10.1" cy="6.7" r="0.95"/>
+  </g>
+</svg>

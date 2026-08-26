@@ -1,0 +1,179 @@
+# Flatpak manifest for monocles chat (Qt client).
+#
+# This is set up for a LOCAL build (network allowed during build, so cargo/rustup can fetch
+# the pinned nightly toolchain + crates). See README.md for the Flathub-offline path.
+#
+#   flatpak install flathub org.kde.Platform//6.10 org.kde.Sdk//6.10
+#   flatpak-builder --user --install --force-clean build-dir packaging/flatpak/de.monocles.chat.qt.yml
+#   flatpak run de.monocles.chat.qt
+app-id: de.monocles.chat.qt
+runtime: org.kde.Platform
+runtime-version: '6.10'
+sdk: org.kde.Sdk
+# WebXDC mini-apps need QtWebEngine, which the KDE runtime does NOT ship. The Flathub
+# QtWebEngine BaseApp provides it under /app (libs, headers, QML module, QtWebEngineProcess);
+# its cleanup script (cleanup-commands below) strips the dev files from the final app.
+base: io.qt.qtwebengine.BaseApp
+base-version: '6.10'
+command: monocles-chat-qt
+
+cleanup-commands:
+  - /app/cleanup-BaseApp.sh
+
+finish-args:
+  # WebXDC: the out-of-process web renderer shipped by the QtWebEngine BaseApp.
+  - --env=QTWEBENGINEPROCESS_PATH=/app/bin/QtWebEngineProcess
+  # XMPP connection + HTTP file upload/download.
+  - --share=network
+  - --share=ipc
+  # GUI.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Audio + video calls, voice messages.
+  - --socket=pulseaudio
+  - --device=all            # camera (v4l2) for video calls; can be narrowed to the camera portal
+  # Group calls (Muji): re-enable TCP/TLS TURN relays for the mesh. Safe ONLY because we bundle a
+  # patched libnice (see the `libnice` module below) that nominates ICE pairs gracefully instead of
+  # aborting — stock libnice crashes here. Lets a participant on a UDP-blocking network join a
+  # group call. Remove together with the libnice module once the runtime's libnice has the fix.
+  - --env=MONOCLES_MUJI_TCP_RELAY=1
+  # Screen sharing goes through the xdg-desktop-portal ScreenCast portal, which is auto-allowed
+  # in the sandbox and hands us a PipeWire fd over D-Bus — so it needs NO extra finish-args (no
+  # pipewire socket, no screen-grab permission). It does require the runtime's GStreamer to ship
+  # the `pipewiresrc` element (gst-plugin-pipewire); the KDE/freedesktop runtime provides it.
+  # If a future runtime drops it, add a gst-plugin-pipewire build module here.
+  # XMPP password + PQ OMEMO2 identity key are kept in the Secret Service, never on disk.
+  - --talk-name=org.freedesktop.secrets
+  # Save received files into the user's Downloads folder.
+  - --filesystem=xdg-download
+
+build-options:
+  # Local build: cargo + rustup need network to fetch the pinned nightly + crates.
+  # (For a Flathub-compliant offline build, see README.md.)
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/monocles-chat-qt/cargo
+    RUSTUP_HOME: /run/build/monocles-chat-qt/rustup
+    CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+modules:
+  # Patched libnice, bundled into /app so it overrides the runtime's for group (Muji) calls.
+  # Stock libnice aborts (priv_conn_check_tick_stream_nominate assertion) on slow TCP-relay
+  # candidate pairs in a multi-agent mesh; this build turns that fatal assertion into a graceful
+  # skip (see packaging/libnice/patch-conncheck.py). /app/lib precedes the runtime's /usr/lib on
+  # the loader path, so the runtime's libgstnice.so (webrtcbin) loads THIS libnice.so.10 — same
+  # SONAME, no plugin rebuild. Paired with --env=MONOCLES_MUJI_TCP_RELAY=1 above. Remove both
+  # once the runtime ships a libnice with the upstream fix.
+  - name: libnice
+    buildsystem: simple
+    build-commands:
+      # Apply the graceful-nomination patch (idempotent; fails the build if it can't match, so we
+      # never ship an unpatched/still-crashing libnice), then build + install into /app.
+      - python3 patch-conncheck.py agent/conncheck.c
+      - meson setup _build --prefix=/app --libdir=lib --buildtype=release -Dgstreamer=disabled -Dtests=disabled -Dexamples=disabled -Dintrospection=disabled -Dgtk_doc=disabled
+      - ninja -C _build
+      - ninja -C _build install
+    sources:
+      - type: git
+        url: https://gitlab.freedesktop.org/libnice/libnice.git
+        tag: '0.1.23'
+      - type: file
+        path: ../libnice/patch-conncheck.py
+        dest-filename: patch-conncheck.py
+
+  - name: monocles-chat-qt
+    buildsystem: simple
+    sources:
+      # The Qt project tree. `deps/libsignal` is skipped here and provided by the dedicated
+      # source below so we can prune its heavy subdirs (and any local build `target/`) and keep
+      # the bundle lean — the libsignal checkout is large and only its Rust workspace is needed.
+      # `target`, the builder cache and the machine-specific `.cargo/config.toml` (DATABASE_URL)
+      # are skipped too — the build exports its own env.
+      - type: dir
+        path: ../..
+        skip:
+          - deps/libsignal
+          - target
+          - .cargo
+          - packaging/flatpak/.flatpak-builder
+          - packaging/flatpak/build-dir
+      # The vendored libsignal cargo workspace, copied straight into deps/libsignal so the
+      # `libsignal-protocol` path dependency resolves LOCALLY — no network fetch of libsignal.
+      # `deps/libsignal` is a real local checkout (clone it per the README; git-ignored). A
+      # top-level `dir` source copies the directory's *contents* into `dest`. Only the Rust
+      # workspace is needed, so the multi-GB java/node/swift/target/doc dirs are skipped (in
+      # case the checkout still carries them).
+      - type: dir
+        path: ../../deps/libsignal
+        dest: deps/libsignal
+        skip:
+          - target
+          - java
+          - node
+          - swift
+          - doc
+          - acknowledgments
+          - bin
+    build-commands:
+      - |
+        set -eux
+        export PATH="$CARGO_HOME/bin:$RUSTUP_HOME/bin:$PATH"
+
+        # 1. Install rustup, then let rust-toolchain.toml pull the pinned nightly
+        #    (required by the vendored libsignal).
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --no-modify-path --default-toolchain none
+
+        # 1b. protoc for prost-build: libsignal's PQ dep `spqr` compiles protobufs in its
+        #     build.rs, but the SDK ships no protoc. Fetch the prebuilt release and point
+        #     prost-build at it via PROTOC/PROTOC_INCLUDE.
+        PROTOC_VERSION=28.3
+        case "$(uname -m)" in
+          x86_64)  PROTOC_ARCH=x86_64 ;;
+          aarch64) PROTOC_ARCH=aarch_64 ;;
+          *)       echo "unsupported arch $(uname -m) for protoc download" >&2; exit 1 ;;
+        esac
+        curl --proto '=https' --tlsv1.2 -sSfL \
+          "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" \
+          -o protoc.zip
+        python3 -c "import zipfile; zipfile.ZipFile('protoc.zip').extractall('protoc')"
+        chmod +x protoc/bin/protoc
+        export PROTOC="$PWD/protoc/bin/protoc"
+        export PROTOC_INCLUDE="$PWD/protoc/include"
+
+        # 2. CXX-Qt locates Qt through qmake (the KDE SDK ships it as qmake6 or qmake).
+        #    qmake reports the runtime's /usr — but QtWebEngine comes from the BaseApp under
+        #    /app, which qmake can't see. Point the C++ shim's compiler at the BaseApp headers
+        #    and the linker at its libs explicitly. mxc-app-qt's build.rs emits
+        #    -lQt6WebEngine{Quick,Core} itself (it does NOT route WebEngine through cxx-qt's
+        #    .qt_module(), which since qt-build-utils 0.9 hard-requires the module's .prl under
+        #    qmake's /usr — absent here, since QtWebEngine lives in /app); only these search
+        #    paths are missing.
+        export QMAKE="$(command -v qmake6 || command -v qmake)"
+        export CXXFLAGS="-I/app/include ${CXXFLAGS:-}"
+        export RUSTFLAGS="-L /app/lib ${RUSTFLAGS:-}"
+
+        # 3. Build the sqlx compile-time check DB from the migrations, so the build needs
+        #    neither a machine-specific DATABASE_URL nor a committed .sqlx/ cache.
+        DB="$PWD/.flatpak-build.db"
+        rm -f "$DB"
+        python3 - "$DB" crates/mxc-store/migrations/*.sql <<'PY'
+        import sqlite3, sys
+        db, *migrations = sys.argv[1:]
+        con = sqlite3.connect(db)
+        for m in sorted(migrations):
+            con.executescript(open(m).read())
+        con.commit(); con.close()
+        PY
+        export DATABASE_URL="sqlite://$DB"
+
+        # 4. Build the release binary (QML + icons embedded as Qt resources via build.rs).
+        cargo build --release --locked -p mxc-app-qt
+
+      - "install -Dm755 target/release/monocles-chat-qt /app/bin/monocles-chat-qt"
+      - "install -Dm644 data/de.monocles.chat.qt.desktop /app/share/applications/de.monocles.chat.qt.desktop"
+      - "install -Dm644 data/de.monocles.chat.qt.metainfo.xml /app/share/metainfo/de.monocles.chat.qt.metainfo.xml"
+      - "install -Dm644 data/icons/de.monocles.chat.qt.svg /app/share/icons/hicolor/scalable/apps/de.monocles.chat.qt.svg"
+      - "install -Dm644 data/icons/de.monocles.chat.qt.png /app/share/icons/hicolor/512x512/apps/de.monocles.chat.qt.png"

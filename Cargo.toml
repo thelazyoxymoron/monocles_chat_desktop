@@ -1,0 +1,97 @@
+# monocles chat — cross-platform desktop client (Qt/QML front-end).
+#
+# Self-contained workspace: the Qt UI crate (mxc-app-qt) plus the shared XMPP/crypto/storage
+# backend crates (mxc-proto, mxc-store, mxc-omemo, mxc-media), copied here so this folder builds
+# independently of the GTK project. Keep the backend crates in sync with the GTK project's copies
+# (they are the OMEMO2/wire-interop source of truth).
+[workspace]
+resolver = "2"
+members = [
+    "crates/mxc-app-qt",
+    "crates/mxc-proto",
+    "crates/mxc-store",
+    "crates/mxc-omemo",
+    "crates/mxc-media",
+]
+# The vendored libsignal tree (deps/libsignal, a symlink to the upstream checkout) is its OWN
+# cargo workspace and uses `.workspace = true` inheritance — it must NOT be absorbed here. We
+# only path-depend on its `libsignal-protocol` member.
+exclude = ["deps"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Arne-Brün Vogelsang <arne@monocles.eu>"]
+repository = "https://codeberg.org/monocles/monocles-chat-desktop"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# --- async / runtime ---
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs"] }
+async-channel = "2.3"
+futures = "0.3"
+futures-util = "0.3"
+
+# --- XMPP (xmpp-rs) ---
+# tokio-xmpp 6 reworked its feature flags: the old `starttls-rust` is now `starttls` (transport)
+# + a rustls crypto-backend feature (`aws_lc_rs`, matching our rustls/tokio-rustls pin) + a
+# cert-root source (`webpki-roots`, the Mozilla bundle the direct-TLS connector also uses).
+tokio-xmpp = { version = "6.0", default-features = false, features = ["starttls", "direct-tls", "aws_lc_rs", "webpki-roots"] }
+xmpp-parsers = "0.23"
+jid = "0.12"
+minidom = "0.19"
+
+# --- storage ---
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- crypto (PQ OMEMO2) — same libsignal v0.94.1 the Android app builds (byte-level interop) ---
+# mlkem1024: PQ-OMEMO2 uses FIPS 203 ML-KEM-1024, not the Round-3 Kyber-1024 that
+# `KeyType::Kyber1024` selects. The two are NOT interoperable — Round 3 folds H(ct) into the
+# shared secret and FIPS 203 does not — so the distinction is load-bearing, not cosmetic.
+libsignal-protocol = { path = "deps/libsignal/rust/protocol", features = ["mlkem1024"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+aes-gcm = "0.10"
+rand = "0.9"
+sha2 = "0.10"
+sha3 = "0.10"
+base64 = "0.22"
+sha1 = "0.10"
+quick-xml = "0.40"
+hex = "0.4"
+
+# --- secrets ---
+# Linux: freedesktop Secret Service (GNOME Keyring / KWallet) over D-Bus.
+oo7 = "0.6"
+# macOS / Windows: OS keychain (Keychain Services / Credential Manager). default-features
+# off so the Linux secret-service backend isn't pulled in — this is only compiled for
+# non-Linux targets (see crates/mxc-store/Cargo.toml).
+# NOTE: kept at v3. keyring 4 is a ground-up rewrite (keyring-core + per-platform store crates,
+# renamed features) and this dependency is compiled ONLY for macOS/Windows — it cannot be
+# build-verified from a Linux host, so the v4 migration is deferred to avoid silently breaking
+# those platform builds.
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
+
+# --- A/V calls (GStreamer) ---
+gstreamer = "0.25"
+gstreamer-webrtc = "0.25"
+gstreamer-sdp = "0.25"
+gstreamer-app = "0.25"
+
+# --- misc ---
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+# reqwest 0.13 renamed the TLS features: the old `rustls-tls` is now `rustls` (rustls over
+# aws-lc-rs, matching our crypto-provider pin) plus `webpki-roots` for the Mozilla trust bundle.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "stream"] }
+
+[profile.dev]
+# libsignal + sqlx-from-source are painfully slow unoptimized; keep deps optimized.
+[profile.dev.package."*"]
+opt-level = 2

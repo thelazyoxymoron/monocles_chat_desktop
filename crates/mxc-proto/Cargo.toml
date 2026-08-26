@@ -1,0 +1,56 @@
+[package]
+name = "mxc-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mxc-store = { path = "../mxc-store" }
+mxc-omemo = { path = "../mxc-omemo" }
+mxc-media = { path = "../mxc-media" }
+
+tokio = { workspace = true }
+tokio-xmpp = { workspace = true }
+xmpp-parsers = { workspace = true }
+jid = { workspace = true }
+minidom = { workspace = true }
+# tokio-xmpp 6's ServerConnector trait returns a `sasl::common::ChannelBinding`, which it does
+# not re-export — our custom direct-TLS connector (src/directtls.rs) names it directly. Same
+# version tokio-xmpp links, so it resolves to a single crate.
+sasl = "0.5"
+# tokio-xmpp 6 hands the reader loop a typed `Stanza` (and `send_stanza` wants one), but the
+# whole XEP layer here works on raw `minidom::Element`. `xso::transform` converts between the
+# two at the client boundary; the `minidom` feature enables Element's AsXml/FromXml impls.
+xso = { version = "0.4", features = ["minidom"] }
+
+async-channel = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+sha1 = { workspace = true }
+# HTTP file upload/download (XEP-0363) + aesgcm:// file encryption.
+reqwest = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+# XEP-0231 BoB content-id hashing for inline stickers.
+sha2 = { workspace = true }
+# Parsing the WebXDC `notify` dict (selfAddr → text) off the wire.
+serde_json = "1"
+# Pin the process-wide rustls crypto provider (aws-lc-rs): tokio-xmpp builds its TLS configs
+# against the process default, so it must be installed explicitly. See client.rs.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+# NOTE: tokio-rustls, webpki-roots and hickory-resolver used to be direct deps for the
+# hand-rolled XEP-0368 connector. As of tokio-xmpp 6 the library ships DirectTls/StartTls
+# connectors that do the SRV resolution, root store and TLS themselves (see src/directtls.rs),
+# so those crates are no longer referenced directly here.
+# Wipe the in-memory password on drop.
+zeroize = "1"

@@ -1,0 +1,5 @@
+# Pinned to match the backend crates: libsignal (pulled in via mxc-omemo through
+# mxc-proto/mxc-store) requires nightly-2026-03-23, and we compile those crates here.
+[toolchain]
+channel = "nightly-2026-03-23"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=monocles chat
+GenericName=XMPP Chat
+Comment=Encrypted XMPP messaging with PQ OMEMO2
+Exec=monocles-chat-qt
+Icon=de.monocles.chat.qt
+Terminal=false
+Categories=Network;InstantMessaging;Chat;Qt;
+Keywords=Chat;Messaging;XMPP;Jabber;OMEMO;monocles;
+StartupNotify=true
+StartupWMClass=monocles-chat-qt

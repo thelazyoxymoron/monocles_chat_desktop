@@ -1,0 +1,39 @@
+[package]
+name = "mxc-omemo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mxc-store = { path = "../mxc-store" }
+
+# The exact crate the monocles Android app builds (v0.94.1) — byte-level PQXDH/SPQR interop.
+libsignal-protocol = { workspace = true }
+
+# OMEMO2 payload cipher: AES-256-GCM with KMAC256-derived key+IV and a context-binding
+# AAD (proto-XEP §5.4). Byte-level interop with monocles Android's XmppOmemo2Message.
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+# Wipe derived payload key material after use (parity with Android's Arrays.fill zeroing).
+zeroize = "1"
+base64 = { workspace = true }
+quick-xml = { workspace = true }
+hex = { workspace = true }
+# cSHAKE256, which KMAC256 is built on (proto-XEP §5.4/§5.5), and SHA3-512 for the hybrid
+# fingerprint (§4.9.3).
+sha3 = { workspace = true }
+
+async-trait = "0.1"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Needed for the runtime handle in OmemoStores (Phase 2 store-trait block_on bridge).
+tokio = { workspace = true }
+
+[dev-dependencies]
+# The SCE tests re-parse `content_inner` with the same XML model the caller uses
+# (mxc-proto's `wrapped.parse::<Element>()`), so a reconstruction that is merely
+# self-consistent but not well-formed still fails the test.
+minidom = { workspace = true }
