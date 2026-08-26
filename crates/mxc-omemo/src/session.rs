@@ -749,16 +749,18 @@ pub async fn establish_session(
     let pq_identity_key = PqIdentityKey::deserialize(&bundle.pq_ik)?;
     let pq_signature = PqSignature::deserialize(&bundle.pq_sig)?;
 
-    // TOFU-pin the post-quantum identity, keyed to the classical identity key. If the peer
-    // presents a *different* `<pq-ik>` for an identity we have already pinned, refuse —
-    // unless the classical fingerprint has been manually verified (trust == 3), in which
+    // TOFU-pin the post-quantum identity, keyed to (owning JID, classical identity key). If
+    // the peer presents a *different* `<pq-ik>` for an identity we have already pinned, refuse
+    // — unless the classical fingerprint has been manually verified (trust == 3), in which
     // case a legitimate post-quantum re-key is accepted and re-pinned (proto-XEP §6.15,
     // §4.9.2). A first-contact pin can only mount a DoS, never an undetected MITM, because
-    // process_prekey_bundle below still verifies the ML-DSA-87 signature.
+    // process_prekey_bundle below still verifies the ML-DSA-87 signature — and scoping the pin
+    // to `remote.jid` keeps even that DoS from reaching across JIDs, since a classical `<ik>`
+    // is public and any peer can republish someone else's.
     let fp_key = crate::pq_pin_key(&ik.serialize());
     let pinned = stores
         .store
-        .get_pinned_omemo2_pq_identity(stores.account_id, &fp_key)
+        .get_pinned_omemo2_pq_identity(stores.account_id, &remote.jid, &fp_key)
         .await?;
     if let Some(pinned) = &pinned {
         if pinned.as_slice() != bundle.pq_ik.as_slice() {
@@ -909,7 +911,7 @@ pub async fn reconcile_pq_pin(
     let fp_key = crate::pq_pin_key(known_ik);
     if let Some(pinned) = stores
         .store
-        .get_pinned_omemo2_pq_identity(stores.account_id, &fp_key)
+        .get_pinned_omemo2_pq_identity(stores.account_id, &remote.jid, &fp_key)
         .await?
     {
         if pinned.as_slice() != bundle.pq_ik.as_slice() {
@@ -1419,7 +1421,7 @@ mod tests {
         // Nothing was pinned by the refused attempts.
         assert!(alice
             .store
-            .get_pinned_omemo2_pq_identity(alice.account_id, &pin_key)
+            .get_pinned_omemo2_pq_identity(alice.account_id, &bob_addr.jid, &pin_key)
             .await
             .unwrap()
             .is_none());
@@ -1429,7 +1431,7 @@ mod tests {
         assert_eq!(
             alice
                 .store
-                .get_pinned_omemo2_pq_identity(alice.account_id, &pin_key)
+                .get_pinned_omemo2_pq_identity(alice.account_id, &bob_addr.jid, &pin_key)
                 .await
                 .unwrap()
                 .unwrap(),
@@ -1450,12 +1452,112 @@ mod tests {
         assert_eq!(
             alice
                 .store
-                .get_pinned_omemo2_pq_identity(alice.account_id, &pin_key)
+                .get_pinned_omemo2_pq_identity(alice.account_id, &bob_addr.jid, &pin_key)
                 .await
                 .unwrap()
                 .unwrap(),
             sentinel,
             "an existing pin must never be overwritten by reconciliation"
+        );
+
+        // …and that pin belongs to bob@example.com alone. A classical `<ik>` is published in
+        // PEP, so any peer can republish someone else's; if the pin were keyed on the
+        // fingerprint alone, mallory's pin would be read back for bob and every later session
+        // with the real bob would be refused as a changed pq_ik. Scoping on the JID is what
+        // keeps that DoS from crossing accounts.
+        assert!(
+            alice
+                .store
+                .get_pinned_omemo2_pq_identity(alice.account_id, "mallory@example.com", &pin_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "a pin must not be visible under a JID that did not write it"
+        );
+        let mallory_addr =
+            DeviceAddr { jid: "mallory@example.com".into(), device_id: bob_dev };
+        alice
+            .store
+            .pin_omemo2_pq_identity(
+                alice.account_id,
+                &mallory_addr.jid,
+                &pin_key,
+                &[0xBBu8; 4],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            alice
+                .store
+                .get_pinned_omemo2_pq_identity(alice.account_id, &bob_addr.jid, &pin_key)
+                .await
+                .unwrap()
+                .unwrap(),
+            sentinel,
+            "a pin written under another JID must not overwrite bob's"
+        );
+    }
+
+    /// A peer device whose identity key is REPLACED must lose its trust: the user verified (or
+    /// blind-trusted) the key that was there before and has said nothing about this one. The
+    /// rebuild itself is allowed — refusing at the libsignal layer would strand a peer who
+    /// legitimately reinstalled — but the new key lands undecided, which every encryption path
+    /// skips. Mirrors monocles Android's `SQLiteAxolotlStore.saveIdentity`.
+    #[tokio::test]
+    async fn replaced_identity_key_loses_trust() {
+        use libsignal_protocol::{Direction, IdentityKeyStore};
+
+        let (alice, _) = party("alice@example.com").await;
+        let jid = "bob@example.com";
+        let dev = 7u32;
+        let addr = protocol_address(jid, dev).unwrap();
+
+        let (first, _, _) = generate_identity();
+        let (second, _, _) = generate_identity();
+        let mut ids = alice.identity_store();
+
+        // First contact: TOFU. The dev store defaults to auto-trust, so bob lands trusted (1).
+        assert!(ids
+            .is_trusted_identity(&addr, first.identity_key(), Direction::Sending)
+            .await
+            .unwrap());
+        ids.save_identity(&addr, first.identity_key()).await.unwrap();
+        // Promote to manually verified — the strongest state, and the one that must not carry.
+        alice.store.set_omemo_trust(alice.account_id, jid, dev as i64, 3).await.unwrap();
+
+        // A different key on the same (jid, device) is still accepted by libsignal, so the
+        // ratchet can be rebuilt…
+        assert!(
+            ids.is_trusted_identity(&addr, second.identity_key(), Direction::Sending)
+                .await
+                .unwrap(),
+            "a replaced key must not hard-fail inside libsignal"
+        );
+        ids.save_identity(&addr, second.identity_key()).await.unwrap();
+
+        // …but the verification does NOT transfer to it.
+        let rec = alice
+            .store
+            .omemo_identity(alice.account_id, jid, dev as i64)
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert_eq!(rec.identity_key, second.identity_key().serialize().to_vec());
+        assert_eq!(rec.trust, 0, "a replaced identity key must be undecided, never inherited");
+
+        // Re-saving the SAME key is not a replacement and leaves a decision alone.
+        alice.store.set_omemo_trust(alice.account_id, jid, dev as i64, 3).await.unwrap();
+        ids.save_identity(&addr, second.identity_key()).await.unwrap();
+        assert_eq!(
+            alice
+                .store
+                .omemo_identity(alice.account_id, jid, dev as i64)
+                .await
+                .unwrap()
+                .unwrap()
+                .trust,
+            3,
+            "an unchanged key keeps its trust"
         );
     }
 }

@@ -112,26 +112,35 @@ impl Store {
 
     // ---- post-quantum identity pins (hybrid identity) -------------------
 
-    /// The post-quantum (ML-DSA-87) identity key pinned to a peer's classical `fingerprint`
-    /// (hex of its serialized classical IdentityKey), if any.
+    /// The post-quantum (ML-DSA-87) identity key `jid` has pinned for its classical
+    /// `fingerprint` (hex of its serialized classical IdentityKey), if any.
+    ///
+    /// `jid` is not decoration. A classical identity key is published in PEP for anyone to
+    /// read, so a pin keyed on the fingerprint alone let one JID poison another's: publish
+    /// someone else's `<ik>` beside your own `<pq-ik>`, get pinned on first contact, and every
+    /// later session with the real owner is refused as a changed pq_ik. Trust and the pin both
+    /// belong to a (JID, key) pair, never to a key on its own.
     pub async fn get_pinned_omemo2_pq_identity(
         &self,
         account_id: i64,
+        jid: &str,
         fingerprint: &str,
     ) -> Result<Option<Vec<u8>>> {
         let row = sqlx::query!(
             r#"SELECT pq_identity_key as "pq_identity_key!: Vec<u8>"
-               FROM omemo_pq_identities WHERE account_id = ?1 AND fingerprint = ?2"#,
-            account_id, fingerprint,
+               FROM omemo_pq_identities
+               WHERE account_id = ?1 AND address_jid = ?2 AND fingerprint = ?3"#,
+            account_id, jid, fingerprint,
         )
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(|r| r.pq_identity_key))
     }
 
-    /// Pin (or re-pin) a peer's post-quantum identity to its classical `fingerprint`. The
+    /// Pin (or re-pin) `jid`'s post-quantum identity to its classical `fingerprint`. The
     /// caller (mxc-omemo) has already authenticated `pq_identity_key` via the bundle's
-    /// ML-DSA-87 signature and applied the change-of-pin policy.
+    /// ML-DSA-87 signature and applied the change-of-pin policy. See
+    /// [`Self::get_pinned_omemo2_pq_identity`] for why the pin is scoped to `jid`.
     pub async fn pin_omemo2_pq_identity(
         &self,
         account_id: i64,
@@ -140,11 +149,11 @@ impl Store {
         pq_identity_key: &[u8],
     ) -> Result<()> {
         sqlx::query!(
-            r#"INSERT INTO omemo_pq_identities (account_id, fingerprint, address_jid, pq_identity_key)
+            r#"INSERT INTO omemo_pq_identities (account_id, address_jid, fingerprint, pq_identity_key)
                VALUES (?1, ?2, ?3, ?4)
-               ON CONFLICT(account_id, fingerprint)
-               DO UPDATE SET pq_identity_key = excluded.pq_identity_key, address_jid = excluded.address_jid"#,
-            account_id, fingerprint, jid, pq_identity_key,
+               ON CONFLICT(account_id, address_jid, fingerprint)
+               DO UPDATE SET pq_identity_key = excluded.pq_identity_key"#,
+            account_id, jid, fingerprint, pq_identity_key,
         )
         .execute(self.pool())
         .await?;
@@ -233,13 +242,28 @@ impl Store {
         identity_key: &[u8],
     ) -> Result<()> {
         // A *new* device starts trusted (1) when "auto-trust new keys" is on, else undecided
-        // (0). Existing rows keep their trust (the ON CONFLICT clause never touches it).
+        // (0). An existing device whose key is UNCHANGED keeps whatever trust it had.
+        //
+        // A REPLACED key is reset to undecided (0), never carried over. Trust belongs to a
+        // (JID, key) pair, not to a device slot: the user verified — or blind-trusted — the key
+        // that was there before, and has said nothing about this one. Blind-trust-before-
+        // verification agrees to accept a *new device*, which is not the same event; a
+        // malicious server can force a rebuild at will (break the session, we re-fetch the
+        // bundle), so carrying the old verdict across would let it swap the identity silently.
+        // The encryption paths gate on trust 1 or 3, so an undecided device is skipped until
+        // the user decides. Mirrors monocles Android's `SQLiteAxolotlStore.saveIdentity`.
         let new_trust: i64 = if self.auto_trust_new_keys().await? { 1 } else { 0 };
         sqlx::query!(
             r#"INSERT INTO omemo_identities (account_id, address_jid, device_id, identity_key, trust)
                VALUES (?1, ?2, ?3, ?4, ?5)
                ON CONFLICT(account_id, address_jid, device_id) DO UPDATE SET
-                 identity_key = excluded.identity_key, active = 1"#,
+                 identity_key = excluded.identity_key,
+                 active = 1,
+                 trust = CASE
+                     WHEN omemo_identities.identity_key = excluded.identity_key
+                     THEN omemo_identities.trust
+                     ELSE 0
+                 END"#,
             account_id, jid, device_id, identity_key, new_trust,
         )
         .execute(self.pool())

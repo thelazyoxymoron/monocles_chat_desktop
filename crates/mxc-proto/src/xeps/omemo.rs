@@ -449,12 +449,38 @@ async fn publish_device_list_replacing(
 
 // --- fetch ------------------------------------------------------------------
 
+/// Most devices we accept from one JID's published OMEMO2 device list.
+///
+/// Every accepted id costs an outbound bundle fetch (see [`sessions_for`]) plus a stored session
+/// and a cached failure entry, and nothing else bounds the list — the XML reader limits nesting
+/// depth, not child count — so a hostile PEP node could turn one device-list fetch into tens of
+/// thousands of IQ round-trips. Far above any plausible real account; the key UI is unusable long
+/// before it. Matches monocles Android's `AxolotlService.MAX_DEVICES_PER_JID`.
+pub const MAX_DEVICES_PER_JID: usize = 128;
+
+/// Most wrapped keys we will try to unwrap for **our own device** out of one message header.
+///
+/// A header legitimately carries one `<key rid='us'>`; two is the known benign case (a sender
+/// that rebuilt the session mid-send and attached both the old and the new wrap). Nothing in the
+/// format forbids more, and each one costs a full trial ratchet decryption, so an unbounded list
+/// turns a single stanza into as much CPU as the sender cares to ask for. Eight leaves generous
+/// room above every legitimate case while bounding the work per stanza.
+///
+/// The cap is on *attempts*, not on trust: the wraps past it are ignored, exactly as if the
+/// sender had not sent them.
+pub const MAX_KEY_CANDIDATES: usize = 8;
+
 async fn fetch_device_list(w: &Writer, jid: &str) -> anyhow::Result<Vec<u32>> {
     let reply = pep::items(w, Some(jid), NODE_DEVICES, Some(1)).await?;
     let mut out = Vec::new();
     for (_, payload) in pep::extract_items(&reply) {
         if payload.name() == "devices" {
             for d in payload.children().filter(|c| c.name() == "device") {
+                if out.len() >= MAX_DEVICES_PER_JID {
+                    warn!(%jid, cap = MAX_DEVICES_PER_JID,
+                        "omemo: device list exceeds the cap — ignoring the rest");
+                    break;
+                }
                 if let Some(id) = d.attr("id").and_then(|s| s.parse::<u32>().ok()) {
                     out.push(id);
                 }
@@ -801,7 +827,7 @@ pub async fn reconcile_pq_pin_if_missing(
     };
     let pin_key = mxc_omemo::pq_pin_key(&rec.identity_key);
     if store
-        .get_pinned_omemo2_pq_identity(cfg.account_id, &pin_key)
+        .get_pinned_omemo2_pq_identity(cfg.account_id, sender_bare, &pin_key)
         .await?
         .is_some()
     {
@@ -887,6 +913,37 @@ pub async fn send_heartbeat(
 /// loosening: the value is compared against *our own* JID, and case-folding is what the JID
 /// equality rules already require. ASCII case folding (rather than full PRECIS) matches how the
 /// rest of this crate compares JIDs, including `Envelope::verify_binding`.
+/// The wrapped keys in `header` that are addressed to our own device, at most
+/// [`MAX_KEY_CANDIDATES`] of them, as `(wrapped_key, is_kex)` — plus whether the list was
+/// truncated by the cap.
+///
+/// Only the `<keys>` block bearing OUR bare JID is read (XEP-0420 §4.6.4): a sender must not be
+/// able to smuggle a key for our device in under another user's block. Undecodable base64 is
+/// skipped rather than fatal, so one bad entry cannot suppress a good one beside it.
+fn select_key_candidates(
+    header: &Element,
+    our_bare: &str,
+    our_device: u32,
+) -> (Vec<(Vec<u8>, bool)>, bool) {
+    let our_rid = our_device.to_string();
+    let mut candidates: Vec<(Vec<u8>, bool)> = header
+        .children()
+        .filter(|c| c.name() == "keys" && keys_block_is_ours(c.attr("jid"), our_bare))
+        .flat_map(|keys| keys.children().filter(|c| c.name() == "key"))
+        .filter(|k| k.attr("rid") == Some(our_rid.as_str()))
+        .filter_map(|k| {
+            B64.decode(k.text().trim()).ok().map(|w| (w, k.attr("kex") == Some("true")))
+        })
+        // One past the cap, so a truncation can be told from an exactly-full list.
+        .take(MAX_KEY_CANDIDATES + 1)
+        .collect();
+    let truncated = candidates.len() > MAX_KEY_CANDIDATES;
+    if truncated {
+        candidates.truncate(MAX_KEY_CANDIDATES);
+    }
+    (candidates, truncated)
+}
+
 fn keys_block_is_ours(jid_attr: Option<&str>, our_bare: &str) -> bool {
     let Some(jid) = jid_attr else { return false };
     let bare = jid.split('/').next().unwrap_or(jid);
@@ -933,16 +990,11 @@ pub async fn decrypt_message(
 
     // Only consider the <keys> block addressed to us (XEP-0420 §4.6.4) — a sender must not be
     // able to smuggle a key for our device in under another user's block.
-    let our_rid = our_device.to_string();
-    let candidates: Vec<(Vec<u8>, bool)> = header
-        .children()
-        .filter(|c| c.name() == "keys" && keys_block_is_ours(c.attr("jid"), cfg.bare()))
-        .flat_map(|keys| keys.children().filter(|c| c.name() == "key"))
-        .filter(|k| k.attr("rid") == Some(our_rid.as_str()))
-        .filter_map(|k| {
-            B64.decode(k.text().trim()).ok().map(|w| (w, k.attr("kex") == Some("true")))
-        })
-        .collect();
+    let (candidates, truncated) = select_key_candidates(header, cfg.bare(), our_device);
+    if truncated {
+        warn!(%sender_bare, sender_device, cap = MAX_KEY_CANDIDATES,
+            "omemo: header carries more wrapped keys for our device than the cap — ignoring the rest");
+    }
     if candidates.is_empty() {
         anyhow::bail!("omemo: no key for our device {our_device}");
     }
@@ -1053,5 +1105,112 @@ mod keys_block_tests {
         assert!(!keys_block_is_ours(Some("alice@evil.test"), "alice@example.com"));
         assert!(!keys_block_is_ours(Some(""), "alice@example.com"));
         assert!(!keys_block_is_ours(None, "alice@example.com"));
+    }
+}
+
+#[cfg(test)]
+mod key_candidate_tests {
+    use super::{select_key_candidates, MAX_KEY_CANDIDATES, NS_OMEMO2};
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use minidom::Element;
+
+    const US: &str = "alice@example.com";
+    const OUR_RID: u32 = 42;
+
+    /// A `<header>` whose `<keys jid=…>` block holds `n` wraps for our device, plus the noise a
+    /// real header carries: another recipient's block, and a key for a different device of ours.
+    fn header_with(jid: &str, n: usize) -> Element {
+        let mut keys = Element::builder("keys", NS_OMEMO2).attr(crate::ncname("jid"), jid);
+        for i in 0..n {
+            keys = keys.append(
+                Element::builder("key", NS_OMEMO2)
+                    .attr(crate::ncname("rid"), OUR_RID.to_string())
+                    .append(B64.encode([i as u8; 16]))
+                    .build(),
+            );
+        }
+        keys = keys.append(
+            Element::builder("key", NS_OMEMO2)
+                .attr(crate::ncname("rid"), "99")
+                .append(B64.encode([0xEEu8; 16]))
+                .build(),
+        );
+        Element::builder("header", NS_OMEMO2)
+            .attr(crate::ncname("sid"), "7")
+            .append(keys.build())
+            .append(
+                Element::builder("keys", NS_OMEMO2)
+                    .attr(crate::ncname("jid"), "bob@example.com")
+                    .append(
+                        Element::builder("key", NS_OMEMO2)
+                            .attr(crate::ncname("rid"), OUR_RID.to_string())
+                            .append(B64.encode([0xFFu8; 16]))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    }
+
+    /// The ordinary cases are untouched: one wrap, or the benign two a sender that rebuilt the
+    /// session mid-send attaches. Only our own block and our own rid are read.
+    #[test]
+    fn legitimate_headers_pass_through() {
+        for n in 1..=2 {
+            let (c, truncated) = select_key_candidates(&header_with(US, n), US, OUR_RID);
+            assert_eq!(c.len(), n);
+            assert!(!truncated);
+            assert_eq!(c[0].0, vec![0u8; 16], "our own block's first wrap");
+        }
+        // Nothing addressed to us at all.
+        let (c, truncated) = select_key_candidates(&header_with("bob@example.com", 3), US, OUR_RID);
+        assert!(c.is_empty(), "another JID's block is never read");
+        assert!(!truncated);
+    }
+
+    /// Each wrap costs a full trial ratchet decryption, so a header stuffed with them must not
+    /// buy the sender unbounded work. Past the cap the rest are ignored, and the caller is told.
+    #[test]
+    fn candidates_are_capped() {
+        let (c, truncated) =
+            select_key_candidates(&header_with(US, MAX_KEY_CANDIDATES * 100), US, OUR_RID);
+        assert_eq!(c.len(), MAX_KEY_CANDIDATES);
+        assert!(truncated);
+
+        // Exactly full is NOT a truncation — the boundary the `take(cap + 1)` exists to get right.
+        let (c, truncated) = select_key_candidates(&header_with(US, MAX_KEY_CANDIDATES), US, OUR_RID);
+        assert_eq!(c.len(), MAX_KEY_CANDIDATES);
+        assert!(!truncated);
+    }
+
+    /// One undecodable wrap must not suppress a good one beside it, and must not consume a slot.
+    #[test]
+    fn undecodable_wraps_are_skipped() {
+        let header = Element::builder("header", NS_OMEMO2)
+            .attr(crate::ncname("sid"), "7")
+            .append(
+                Element::builder("keys", NS_OMEMO2)
+                    .attr(crate::ncname("jid"), US)
+                    .append(
+                        Element::builder("key", NS_OMEMO2)
+                            .attr(crate::ncname("rid"), OUR_RID.to_string())
+                            .append("!!!not base64!!!")
+                            .build(),
+                    )
+                    .append(
+                        Element::builder("key", NS_OMEMO2)
+                            .attr(crate::ncname("rid"), OUR_RID.to_string())
+                            .attr(crate::ncname("kex"), "true")
+                            .append(B64.encode([0xABu8; 16]))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+        let (c, truncated) = select_key_candidates(&header, US, OUR_RID);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0], (vec![0xABu8; 16], true), "the kex flag survives");
+        assert!(!truncated);
     }
 }

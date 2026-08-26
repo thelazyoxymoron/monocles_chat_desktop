@@ -128,15 +128,39 @@ impl IdentityKeyStore for IdentityStore {
         let (jid, dev) = parts(address);
         let serialized = identity.serialize();
         let existed = self.store.omemo_identity(self.account_id, &jid, dev).await.map_err(err)?;
+        let replaced = matches!(&existed, Some(old) if old.identity_key.as_slice() != &serialized[..]);
+        // `save_omemo_identity` resets a replaced key's trust to undecided; log it, because
+        // from here on that device is skipped by every encryption path until the user acts.
+        if replaced {
+            tracing::warn!(
+                %jid,
+                device_id = dev,
+                "omemo: identity key REPLACED — trust reset to undecided, awaiting verification"
+            );
+        }
         self.store
             .save_omemo_identity(self.account_id, &jid, dev, &serialized)
             .await
             .map_err(err)?;
-        match existed {
-            Some(old) if old.identity_key.as_slice() != &serialized[..] => Ok(IdentityChange::ReplacedExisting),
-            _ => Ok(IdentityChange::NewOrUnchanged),
+        if replaced {
+            Ok(IdentityChange::ReplacedExisting)
+        } else {
+            Ok(IdentityChange::NewOrUnchanged)
         }
     }
+    /// Whether libsignal may build/advance a ratchet toward this identity. This is NOT the
+    /// application's trust decision — that lives in `omemo_identities.trust` and is enforced by
+    /// `mxc-proto` (only trust 1 or 3 is ever encrypted to).
+    ///
+    /// A **replaced** identity key is accepted here on purpose. Refusing it would abort inside
+    /// libsignal, leaving a peer who legitimately reinstalled on the same device id permanently
+    /// unreachable with no recovery short of wiping all peer state. Instead the rebuild
+    /// proceeds and [`Self::save_identity`] files the new key as undecided, so the app-level
+    /// gate blocks it and the user is asked. Same split as monocles Android's
+    /// `SQLiteAxolotlStore` (`isTrustedIdentity` → true; trust enforced in `AxolotlService`).
+    ///
+    /// An *explicitly untrusted* row still blocks its own key: that is a standing user decision
+    /// about this device, not an unanswered question.
     async fn is_trusted_identity(
         &self,
         address: &ProtocolAddress,
@@ -146,10 +170,8 @@ impl IdentityKeyStore for IdentityStore {
         let (jid, dev) = parts(address);
         match self.store.omemo_identity(self.account_id, &jid, dev).await.map_err(err)? {
             None => Ok(true), // TOFU: accept new device (surfaced to UI for verification)
-            Some(rec) => {
-                let same = rec.identity_key.as_slice() == &identity.serialize()[..];
-                Ok(same && rec.trust != TRUST_UNTRUSTED)
-            }
+            Some(rec) if rec.identity_key.as_slice() != &identity.serialize()[..] => Ok(true),
+            Some(rec) => Ok(rec.trust != TRUST_UNTRUSTED),
         }
     }
     async fn get_identity(&self, address: &ProtocolAddress) -> R<Option<IdentityKey>> {

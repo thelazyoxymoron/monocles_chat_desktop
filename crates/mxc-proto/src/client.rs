@@ -402,7 +402,7 @@ impl CoreActor {
         for id in self.store.list_omemo_identities(account_id, &jid).await?.into_iter() {
             devices.push(crate::event::DeviceKey {
                 device_id: id.device_id,
-                fingerprint: device_fingerprint(&self.store, account_id, &id.identity_key).await,
+                fingerprint: device_fingerprint(&self.store, account_id, &jid, &id.identity_key).await,
                 trust: id.trust,
                 active: id.active,
             });
@@ -450,7 +450,8 @@ impl CoreActor {
         {
             devices.push(crate::event::DeviceKey {
                 device_id: id.device_id,
-                fingerprint: device_fingerprint(&self.store, account_id, &id.identity_key).await,
+                fingerprint: device_fingerprint(&self.store, account_id, cfg.bare(), &id.identity_key)
+                    .await,
                 trust: id.trust,
                 active: id.active,
             });
@@ -1018,10 +1019,18 @@ impl CoreActor {
 /// fingerprint when a post-quantum identity is pinned for it, otherwise the classical one
 /// (e.g. a device we have only just seen but not yet built a session toward). `identity_key`
 /// is the device's serialized (33-byte) classical identity key.
-async fn device_fingerprint(store: &Store, account_id: i64, identity_key: &[u8]) -> String {
+///
+/// `jid` is the bare JID that owns the key — required, because the pin is scoped to it (a
+/// classical `<ik>` is public, so a fingerprint alone does not name one device's pin).
+async fn device_fingerprint(
+    store: &Store,
+    account_id: i64,
+    jid: &str,
+    identity_key: &[u8],
+) -> String {
     let pin_key = mxc_omemo::pq_pin_key(identity_key);
     match store
-        .get_pinned_omemo2_pq_identity(account_id, &pin_key)
+        .get_pinned_omemo2_pq_identity(account_id, jid, &pin_key)
         .await
         .ok()
         .flatten()

@@ -151,11 +151,24 @@ fn finish(jid_part: &str, query: Option<&str>, separator: char) -> Option<Parsed
             continue;
         };
         let Ok(device_id) = suffix.parse::<i64>() else { continue };
+        // A device id is a positive 31-bit integer; a negative one is not a device.
+        if device_id < 0 {
+            continue;
+        }
         let Some(hex) = normalize_fingerprint(&percent_decode(value)) else { continue };
         fingerprints.push(UriFingerprint { kind, device_id, hex });
+        if fingerprints.len() >= MAX_URI_FINGERPRINTS {
+            break;
+        }
     }
     Some(ParsedUri { jid, fingerprints })
 }
+
+/// Upper bound on how many fingerprints one URI may carry. A legitimate code holds the sender's
+/// key per stack plus one per other verified device of the same account — a couple of dozen at
+/// the very outside. Without a cap, a single scanned code could ask us to write hundreds of rows
+/// into the identity table. Matches monocles Android's `XmppUri.MAX_FINGERPRINTS`.
+const MAX_URI_FINGERPRINTS: usize = 64;
 
 /// Lowercase, whitespace-free hex of the 32-byte key, or `None` when the value is not a
 /// fingerprint (wrong length, non-hex). A leading `05` type byte is stripped.
@@ -285,6 +298,22 @@ mod tests {
         let parsed = parse(&format!("xmpp:a@b.com?omemo-sid-1={PQ};omemo-sid-1={LEGACY}")).unwrap();
         assert_eq!(parsed.fingerprints.len(), 1);
         assert_eq!(parsed.fingerprints[0].hex, PQ);
+        // A device id is a positive integer; a negative one names no device.
+        let parsed = parse(&format!("xmpp:a@b.com?omemo-sid--1={PQ}")).unwrap();
+        assert!(parsed.fingerprints.is_empty());
+    }
+
+    /// One scanned code must not be able to ask us to write an unbounded number of identity
+    /// rows. Mirrors monocles Android's `XmppUri.MAX_FINGERPRINTS`.
+    #[test]
+    fn fingerprint_count_is_capped() {
+        let query = (0..MAX_URI_FINGERPRINTS * 3)
+            .map(|i| format!("omemo-sid-{i}={PQ}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        let parsed = parse(&format!("xmpp:a@b.com?{query}")).expect("parses");
+        assert_eq!(parsed.fingerprints.len(), MAX_URI_FINGERPRINTS);
+        assert_eq!(parsed.jid, "a@b.com", "the JID still parses past the cap");
     }
 
     #[test]
